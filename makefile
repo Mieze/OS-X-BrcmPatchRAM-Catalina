@@ -7,8 +7,13 @@ ifeq "$(VERSION_ERA)" "10.10-"
 KEXT=BrcmPatchRAM.kext
 INSTDIR=/System/Library/Extensions
 else
+ifeq "$(VERSION_ERA)" "10.14+"
+KEXT=BrcmPatchRAM3.kext
+INSTDIR=/Library/Extensions
+else
 KEXT=BrcmPatchRAM2.kext
 INSTDIR=/Library/Extensions
+endif
 endif
 
 # Note: BrcmFirmwareStore.kext obsolete (but still deleted here if present)

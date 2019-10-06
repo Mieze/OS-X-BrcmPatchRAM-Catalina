@@ -380,14 +380,21 @@ OSData* BrcmFirmwareStore::loadFirmwareFile(const char* filename, const char* su
     char path[PATH_MAX];
     snprintf(path, PATH_MAX, "%s.%s", filename, suffix);
     
+#ifdef DEBUG
     OSReturn ret = OSKextRequestResource(OSKextGetCurrentIdentifier(),
                           path,
                           requestResourceCallback,
                           &context,
                           NULL);
     
-    DebugLog("OSKextRequestResource: %08x\n", ret);
-    
+    AlwaysLog("OSKextRequestResource: %08x\n", ret);
+#else
+    OSKextRequestResource(OSKextGetCurrentIdentifier(),
+                          path,
+                          requestResourceCallback,
+                          &context,
+                          NULL);
+#endif
     // wait for completion of the async read
     IOLockSleep(mCompletionLock, this, 0);
     
