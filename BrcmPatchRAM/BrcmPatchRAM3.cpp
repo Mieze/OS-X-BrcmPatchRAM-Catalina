@@ -63,7 +63,7 @@ static IOPMPowerState myTwoStates[2] =
  * support this mechanism. It must be terminated with a zero entry.
  *
  * I assume that more devices (all?) also work this way so that
- * they should be added to the list. It might be ossible that this
+ * they should be added to the list. It might be possible that this
  * is a common feature among Broadcom BT controllers making the list
  * obsolete, but for now, we still need it.
  */
@@ -71,6 +71,7 @@ static DeviceHskSupport hskSupport[] =
 {
     { 0x0a5c, 0x216f },
     { 0x0a5c, 0x21ec },
+    { 0x0a5c, 0x6412 },
     { 0x0,    0x0    }
 };
 
@@ -155,7 +156,12 @@ IOService* BrcmPatchRAM::probe(IOService *provider, SInt32 *probeScore)
     mProductId = mDevice.getProductID();
     
     // Check if device supports handshake.
-    mSupportsHandshake = supportsHandshake(mVendorId, mProductId);
+    if (mPreResetDelay == 0) {
+        /* Force handshake mode */
+        mSupportsHandshake = true;
+    } else {
+        mSupportsHandshake = supportsHandshake(mVendorId, mProductId);
+    }
     DebugLog("Device %s handshake.\n", mSupportsHandshake ? "supports" : "doesn't support");
     
     /* Get firmware for device. */
@@ -186,6 +192,18 @@ bool BrcmPatchRAM::start(IOService *provider)
     if (!super::start(provider))
         goto done;
 
+    /*
+     * Register for power state notifications as it seems to cause
+     * a re-probe in case start fails to upload firmware due to
+     * unexpected power state transitions. Without it, the driver
+     * sometimes fails to upload firmware on boot but will succeed
+     * later on wakeup.
+     */
+    PMinit();
+    registerPowerDriver(this, myTwoStates, 2);
+    provider->joinPMtree(this);
+    makeUsable();
+    
     mCompletionLock = IOLockAlloc();
     
     if (!mCompletionLock)
@@ -206,17 +224,6 @@ bool BrcmPatchRAM::start(IOService *provider)
     setProperty("RM,Build", "Release-" LOGNAME);
 #endif
     
-    /*
-     * Register for power state notifications as it seems to cause
-     * a re-probe in case start fails to upload firmware due to
-     * unexpected power state transitions. Without it, the driver
-     * sometimes fails to upload firmware on boot but will succeed
-     * later on wakeup.
-     */
-    PMinit();
-    registerPowerDriver(this, myTwoStates, 2);
-    provider->joinPMtree(this);
-
     /* Wait for device to become ready after reset. */
     IOSleep(mPostResetDelay);
     

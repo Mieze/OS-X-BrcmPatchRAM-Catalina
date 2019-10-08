@@ -73,6 +73,7 @@ static DeviceHskSupport hskSupport[] =
 {
     { 0x0a5c, 0x216f },
     { 0x0a5c, 0x21ec },
+    { 0x0a5c, 0x6412 },
     { 0x0,    0x0    }
 };
 
@@ -262,7 +263,12 @@ IOService* BrcmPatchRAM::probe(IOService *provider, SInt32 *probeScore)
     mProductId = mDevice.getProductID();
 
     // Check if device supports handshake.
-    mSupportsHandshake = supportsHandshake(mVendorId, mProductId);
+    if (mPreResetDelay == 0) {
+        /* Force handshake mode */
+        mSupportsHandshake = true;
+    } else {
+        mSupportsHandshake = supportsHandshake(mVendorId, mProductId);
+    }
     DebugLog("Device %s handshake.\n", mSupportsHandshake ? "supports" : "doesn't support");
 
     // get firmware here to pre-cache for eventual use on wakeup or now
@@ -1346,7 +1352,6 @@ bool BrcmPatchRAM::performUpgrade()
                 break;
                 
             case kResetWrite:
-                //IOSleep(mPreResetDelay);
                 hciCommand(&HCI_RESET, sizeof(HCI_RESET));
                 break;
 
