@@ -72,6 +72,7 @@ static DeviceHskSupport hskSupport[] =
     { 0x0a5c, 0x216f },
     { 0x0a5c, 0x21ec },
     { 0x0a5c, 0x6412 },
+    { 0x0489, 0xe07a },
     { 0x0,    0x0    }
 };
 
@@ -531,6 +532,10 @@ bool BrcmPatchRAM::continuousRead()
                 AlwaysLog("[%04x:%04x]: continuousRead - Failed, read dead (0x%08x)\n", mVendorId, mProductId, result);
                 return false;
             }
+        } else {
+            /* Don't forget to take care of other errors. */
+            AlwaysLog("[%04x:%04x]: continuousRead - Failed with error (0x%08x)\n", mVendorId, mProductId, result);
+            return false;
         }
     }
     return true;
@@ -907,6 +912,7 @@ const char* BrcmPatchRAM::getState(DeviceState deviceState)
         {kResetComplete,      "Reset complete"       },
         {kUpdateComplete,     "Update complete"      },
         {kUpdateNotNeeded,    "Update not needed"    },
+        {kUpdateAborted,      "Update aborted"       },
         {0,                   NULL                   }
     };
     
