@@ -211,7 +211,7 @@ public:
 #endif
 };
 
-#ifdef NON_RESIDENT
+#if defined(NON_RESIDENT) && (!defined(TARGET_CATALINA))
 
 #define kBrcmPatchRAMResidency "BrcmPatchRAMResidency"
 class BrcmPatchRAMResidency : public IOService
@@ -224,6 +224,6 @@ public:
     virtual bool start(IOService *provider);
 };
 
-#endif //NON_RESIDENT
+#endif //defined(NON_RESIDENT) && (!defined(TARGET_CATALINA))
 
 #endif //__BrcmPatchRAM__

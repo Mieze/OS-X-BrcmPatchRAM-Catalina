@@ -38,6 +38,8 @@
 #include "hci.h"
 #include "BrcmPatchRAM.h"
 
+#define kReadBufferSize 0x200
+
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
 enum { kMyOffPowerState = 0, kMyOnPowerState = 1 };
@@ -184,7 +186,8 @@ bool BrcmPatchRAM::start(IOService *provider)
 {
     char buf[128];
     uint64_t start_time, end_time, nano_secs;
-    bool result = false;
+    IOReturn result;
+    bool success = false;
     
     DebugLog("start\n");
     
@@ -208,7 +211,25 @@ bool BrcmPatchRAM::start(IOService *provider)
     mCompletionLock = IOLockAlloc();
     
     if (!mCompletionLock)
-        goto done;
+        goto error1;
+
+    /*
+     * Setup and prepare read buffer now as it can be reused and
+     * it would be inefficient to call prepare() over and over again.
+     */
+    mReadBuffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionIn, kReadBufferSize);
+    
+    if (!mReadBuffer) {
+        AlwaysLog("[%04x:%04x]: Failed to allocate read buffer.\n", mVendorId, mProductId);
+        goto error2;
+    }
+    if ((result = mReadBuffer->prepare(kIODirectionIn)) != kIOReturnSuccess) {
+        AlwaysLog("[%04x:%04x]: Failed to prepare read buffer (0x%08x)\n", mVendorId, mProductId, result);
+        goto error3;
+    }
+    mInterruptCompletion.owner = this;
+    mInterruptCompletion.action = readCompletion;
+    mInterruptCompletion.parameter = NULL;
 
     /* Reset the device to put it in a defined state. */
     mDevice.setDevice(provider);
@@ -230,7 +251,28 @@ bool BrcmPatchRAM::start(IOService *provider)
     
     uploadFirmware();
     
-    result = true;
+    success = true;
+    goto done;
+    
+    /*
+     * error handling
+     *
+     * In case start() fails after super::start() has already been
+     * called, it's not enough to free allocated resources but we also
+     * have to call PMstop() and super::stop() in order to avoid
+     * memory leaks as they would never be called in such a situation
+     * if we forget to do so.
+     */
+error3:
+    OSSafeReleaseNULL(mReadBuffer);
+
+error2:
+    IOLockFree(mCompletionLock);
+    mCompletionLock = NULL;
+    
+error1:
+    PMstop();
+    super::stop(provider);
     
 done:
     clock_get_uptime(&end_time);
@@ -238,17 +280,25 @@ done:
     uint64_t milli_secs = nano_secs / 1000000;
     AlwaysLog("Processing time %llu.%llu seconds.\n", milli_secs / 1000, milli_secs % 1000);
 
-    return result;
+    return success;
 }
 
 void BrcmPatchRAM::stop(IOService* provider)
 {
     DebugLog("stop\n");
     
-    OSSafeReleaseNULL(mFirmwareStore);
-    
     PMstop();
 
+    OSSafeReleaseNULL(mFirmwareStore);
+
+    if (mReadBuffer) {
+        mReadBuffer->complete(kIODirectionIn);
+
+        mInterruptCompletion.owner = NULL;
+        mInterruptCompletion.action = NULL;
+
+        OSSafeReleaseNULL(mReadBuffer);
+    }
     if (mCompletionLock) {
         IOLockFree(mCompletionLock);
         mCompletionLock = NULL;
@@ -312,7 +362,6 @@ void BrcmPatchRAM::uploadFirmware()
             } else {
                 AlwaysLog("[%04x:%04x]: Firmware upgrade failed.\n", mVendorId, mProductId);
             }
-            OSSafeReleaseNULL(mReadBuffer); // mReadBuffer is allocated by performUpgrade but not released
         }
         mInterface.close(this);
     }
@@ -341,23 +390,7 @@ BrcmFirmwareStore* BrcmPatchRAM::getFirmwareStore()
             // and wait...
             mFirmwareStore = OSDynamicCast(BrcmFirmwareStore, waitForMatchingService(serviceMatching(kBrcmFirmwareStoreService), 2000UL*1000UL*1000UL));
         }
-        
-#ifdef NON_RESIDENT
-        // also need BrcmPatchRAMResidency
-        IOService* residency = OSDynamicCast(BrcmPatchRAMResidency, waitForMatchingService(serviceMatching(kBrcmPatchRAMResidency), 0));
-        
-        if (!residency) {
-            // and wait...
-            residency = OSDynamicCast(BrcmPatchRAMResidency, waitForMatchingService(serviceMatching(kBrcmPatchRAMResidency), 2000UL*1000UL*1000UL));
-            
-            if (residency)
-                residency->release();
-            else
-                AlwaysLog("[%04x:%04x]: BrcmPatchRAMResidency does not appear to be available.\n", mVendorId, mProductId);
-        }
-#endif
     }
-    
     if (!mFirmwareStore)
         AlwaysLog("[%04x:%04x]: BrcmFirmwareStore does not appear to be available.\n", mVendorId, mProductId);
     
@@ -502,28 +535,10 @@ bool BrcmPatchRAM::continuousRead()
 {
     IOReturn result;
     
-    if (!mReadBuffer) {
-        mReadBuffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionIn, 0x200);
-        
-        if (!mReadBuffer) {
-            AlwaysLog("[%04x:%04x]: continuousRead - failed to allocate read buffer.\n", mVendorId, mProductId);
-            return false;
-        }
-        mInterruptCompletion.owner = this;
-        mInterruptCompletion.action = readCompletion;
-        mInterruptCompletion.parameter = NULL;
-    }
-    
-    result = mReadBuffer->prepare(kIODirectionIn);
-    
-    if (result != kIOReturnSuccess) {
-        AlwaysLog("[%04x:%04x]: continuousRead - failed to prepare buffer (0x%08x)\n", mVendorId, mProductId, result);
-        return false;
-    }
-    
     if ((result = mInterruptPipe.read(mReadBuffer, 0, 0, mReadBuffer->getLength(), &mInterruptCompletion)) != kIOReturnSuccess) {
         AlwaysLog("[%04x:%04x]: continuousRead - Failed to queue read (0x%08x)\n", mVendorId, mProductId, result);
         
+        /* Try again in case of a pipe stall. */
         if (result == kIOUSBPipeStalled) {
             mInterruptPipe.clearStall();
             result = mInterruptPipe.read(mReadBuffer, 0, 0, mReadBuffer->getLength(), &mInterruptCompletion);
@@ -546,10 +561,6 @@ void BrcmPatchRAM::readCompletion(void* target, void* parameter, IOReturn status
     BrcmPatchRAM *me = (BrcmPatchRAM*)target;
     
     IOLockLock(me->mCompletionLock);
-    
-    IOReturn result = me->mReadBuffer->complete(kIODirectionIn);
-    if (result != kIOReturnSuccess)
-        DebugLog("[%04x:%04x]: ReadCompletion failed to complete read buffer (\"%s\" 0x%08x).\n", me->mVendorId, me->mProductId, me->stringFromReturn(result), result);
     
     switch (status)
     {
@@ -719,26 +730,30 @@ IOReturn BrcmPatchRAM::hciParseResponse(void* response, UInt16 length, void* out
 
 IOReturn BrcmPatchRAM::bulkWrite(const void* data, UInt16 length)
 {
-    IOReturn result;
+    IOMemoryDescriptor* buffer;
+    IOReturn result = kIOReturnNoMemory;
     
-    if (IOMemoryDescriptor* buffer = IOMemoryDescriptor::withAddress((void*)data, length, kIODirectionOut)) {
-        if ((result = buffer->prepare(kIODirectionOut)) == kIOReturnSuccess) {
-            if ((result = mBulkPipe.write(buffer, 0, 0, buffer->getLength(), NULL)) == kIOReturnSuccess) {
-                //DEBUG_LOG("%s: Wrote %d bytes to bulk pipe.\n", getName(), length);
-            } else {
-                AlwaysLog("[%04x:%04x]: Failed to write to bulk pipe (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
-            }
-        } else {
-            AlwaysLog("[%04x:%04x]: Failed to prepare bulk write memory buffer (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
-        }
-        if ((result = buffer->complete(kIODirectionOut)) != kIOReturnSuccess)
-            AlwaysLog("[%04x:%04x]: Failed to complete bulk write memory buffer (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
-        
-        buffer->release();
-    } else {
+    buffer = IOMemoryDescriptor::withAddress((void*)data, length, kIODirectionOut);
+    
+    if (!buffer) {
         AlwaysLog("[%04x:%04x]: Unable to allocate bulk write buffer.\n", mVendorId, mProductId);
-        result = kIOReturnNoMemory;
+        goto done;
     }
+    if ((result = buffer->prepare(kIODirectionOut)) != kIOReturnSuccess) {
+        AlwaysLog("[%04x:%04x]: Failed to prepare bulk write memory buffer (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
+        goto cleanup;
+    }
+    if ((result = mBulkPipe.write(buffer, 0, 0, buffer->getLength(), NULL)) != kIOReturnSuccess) {
+        AlwaysLog("[%04x:%04x]: Failed to write to bulk pipe (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
+    }
+    if ((result = buffer->complete(kIODirectionOut)) != kIOReturnSuccess) {
+        AlwaysLog("[%04x:%04x]: Failed to complete bulk write memory buffer (\"%s\" 0x%08x).\n", mVendorId, mProductId, stringFromReturn(result), result);
+    }
+    
+cleanup:
+    buffer->release();
+    
+done:
     return result;
 }
 
@@ -775,37 +790,43 @@ bool BrcmPatchRAM::performUpgrade()
         switch (mDeviceState)
         {
             case kInitialize:
-                hciCommand(&HCI_VSC_READ_VERBOSE_CONFIG, sizeof(HCI_VSC_READ_VERBOSE_CONFIG));
+                if (hciCommand(&HCI_VSC_READ_VERBOSE_CONFIG, sizeof(HCI_VSC_READ_VERBOSE_CONFIG)) != kIOReturnSuccess) {
+                    DebugLog("HCI_VSC_READ_VERBOSE_CONFIG failed, aborting.");
+                    mDeviceState = kUpdateAborted;
+                    continue;
+                }
                 break;
                 
             case kFirmwareVersion:
                 // Unable to retrieve firmware store
-                if (!(firmwareStore = getFirmwareStore()))
-                {
+                if (!(firmwareStore = getFirmwareStore())) {
                     mDeviceState = kUpdateAborted;
                     continue;
                 }
                 instructions = firmwareStore->getFirmware(mVendorId, mProductId, OSDynamicCast(OSString, getProperty(kFirmwareKey)));
+                
                 // Unable to retrieve firmware instructions
-                if (!instructions)
-                {
+                if (!instructions) {
                     mDeviceState = kUpdateAborted;
                     continue;
                 }
                 
                 // Initiate firmware upgrade
-                hciCommand(&HCI_VSC_DOWNLOAD_MINIDRIVER, sizeof(HCI_VSC_DOWNLOAD_MINIDRIVER));
+                if (hciCommand(&HCI_VSC_DOWNLOAD_MINIDRIVER, sizeof(HCI_VSC_DOWNLOAD_MINIDRIVER)) != kIOReturnSuccess) {
+                    DebugLog("HCI_VSC_DOWNLOAD_MINIDRIVER failed, aborting.");
+                    mDeviceState = kUpdateAborted;
+                    continue;
+                }
                 break;
                 
             case kMiniDriverComplete:
                 // Write firmware data to bulk pipe
                 iterator = OSCollectionIterator::withCollection(instructions);
-                if (!iterator)
-                {
+                
+                if (!iterator) {
                     mDeviceState = kUpdateAborted;
                     continue;
                 }
-                
                 // If this IOSleep is not issued, the device is not ready to receive
                 // the firmware instructions and we will deadlock due to lack of
                 // responses.
@@ -818,17 +839,21 @@ bool BrcmPatchRAM::performUpgrade()
                 
             case kInstructionWrite:
                 // should never happen, but would cause a crash
-                if (!iterator)
-                {
+                if (!iterator) {
                     mDeviceState = kUpdateAborted;
                     continue;
                 }
                 
-                if ((data = OSDynamicCast(OSData, iterator->getNextObject())))
+                if ((data = OSDynamicCast(OSData, iterator->getNextObject()))) {
                     bulkWrite(data->getBytesNoCopy(), data->getLength());
-                else
+                } else {
                     // Firmware data fully written
-                    hciCommand(&HCI_VSC_END_OF_RECORD, sizeof(HCI_VSC_END_OF_RECORD));
+                    if (hciCommand(&HCI_VSC_END_OF_RECORD, sizeof(HCI_VSC_END_OF_RECORD)) != kIOReturnSuccess) {
+                        DebugLog("HCI_VSC_END_OF_RECORD failed, aborting.");
+                        mDeviceState = kUpdateAborted;
+                        continue;
+                    }
+                }
                 break;
                 
             case kInstructionWritten:
@@ -838,8 +863,8 @@ bool BrcmPatchRAM::performUpgrade()
             case kFirmwareWritten:
                 if (!mSupportsHandshake) {
                     IOSleep(mPreResetDelay);
-                    if (hciCommand(&HCI_RESET, sizeof(HCI_RESET)) != kIOReturnSuccess)
-                    {
+                    
+                    if (hciCommand(&HCI_RESET, sizeof(HCI_RESET)) != kIOReturnSuccess) {
                         DebugLog("HCI_RESET failed, aborting.");
                         mDeviceState = kUpdateAborted;
                         continue;
@@ -848,8 +873,7 @@ bool BrcmPatchRAM::performUpgrade()
                 break;
                 
             case kResetWrite:
-                if (hciCommand(&HCI_RESET, sizeof(HCI_RESET)) != kIOReturnSuccess)
-                {
+                if (hciCommand(&HCI_RESET, sizeof(HCI_RESET)) != kIOReturnSuccess) {
                     DebugLog("HCI_RESET failed, aborting.");
                     mDeviceState = kUpdateAborted;
                     continue;
@@ -871,8 +895,7 @@ bool BrcmPatchRAM::performUpgrade()
         }
         
         // queue async read
-        if (!continuousRead())
-        {
+        if (!continuousRead()) {
             mDeviceState = kUpdateAborted;
             continue;
         }
@@ -971,24 +994,6 @@ const char* BrcmPatchRAM::stringFromReturn(IOReturn rtn)
     
     return super::stringFromReturn(rtn);
 }
-
-
-#ifdef NON_RESIDENT
-
-OSDefineMetaClassAndStructors(BrcmPatchRAMResidency, IOService)
-
-bool BrcmPatchRAMResidency::start(IOService *provider)
-{
-    DebugLog("BrcmPatchRAMResidency start\n");
-    
-    if (!super::start(provider))
-        return false;
-    
-    registerService();
-    
-    return true;
-}
-#endif /* NON_RESIDENT */
 
 #endif /* TARGET_CATALINA */
 
